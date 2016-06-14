@@ -36,7 +36,7 @@ import org.apache.spark.util.collection.unsafe.sort.RecordComparator;
 import org.apache.spark.util.collection.unsafe.sort.UnsafeExternalSorter;
 import org.apache.spark.util.collection.unsafe.sort.UnsafeSorterIterator;
 
-final class UnsafeExternalRowSorter {
+public final class UnsafeExternalRowSorter {
 
   /**
    * If positive, forces records to be spilled to disk at the given frequency (measured in numbers
@@ -51,7 +51,20 @@ final class UnsafeExternalRowSorter {
   private final UnsafeExternalSorter sorter;
 
   public abstract static class PrefixComputer {
-    abstract long computePrefix(InternalRow row);
+
+    public static class Prefix {
+      /** Key prefix value, or the null prefix value if isNull = true. **/
+      long value;
+
+      /** Whether the key is null. */
+      boolean isNull;
+    }
+
+    /**
+     * Computes prefix for the given row. For efficiency, the returned object may be reused in
+     * further calls to a given PrefixComputer.
+     */
+    abstract Prefix computePrefix(InternalRow row);
   }
 
   public UnsafeExternalRowSorter(
@@ -59,7 +72,8 @@ final class UnsafeExternalRowSorter {
       Ordering<InternalRow> ordering,
       PrefixComparator prefixComparator,
       PrefixComputer prefixComputer,
-      long pageSizeBytes) throws IOException {
+      long pageSizeBytes,
+      boolean canUseRadixSort) throws IOException {
     this.schema = schema;
     this.prefixComputer = prefixComputer;
     final SparkEnv sparkEnv = SparkEnv.get();
@@ -67,11 +81,13 @@ final class UnsafeExternalRowSorter {
     sorter = UnsafeExternalSorter.create(
       taskContext.taskMemoryManager(),
       sparkEnv.blockManager(),
+      sparkEnv.serializerManager(),
       taskContext,
       new RowComparator(ordering, schema.length()),
       prefixComparator,
       /* initialSize */ 4096,
-      pageSizeBytes
+      pageSizeBytes,
+      canUseRadixSort
     );
   }
 
@@ -84,14 +100,14 @@ final class UnsafeExternalRowSorter {
     testSpillFrequency = frequency;
   }
 
-  @VisibleForTesting
-  void insertRow(UnsafeRow row) throws IOException {
-    final long prefix = prefixComputer.computePrefix(row);
+  public void insertRow(UnsafeRow row) throws IOException {
+    final PrefixComputer.Prefix prefix = prefixComputer.computePrefix(row);
     sorter.insertRecord(
       row.getBaseObject(),
       row.getBaseOffset(),
       row.getSizeInBytes(),
-      prefix
+      prefix.value,
+      prefix.isNull
     );
     numRowsInserted++;
     if (testSpillFrequency > 0 && (numRowsInserted % testSpillFrequency) == 0) {
@@ -106,12 +122,18 @@ final class UnsafeExternalRowSorter {
     return sorter.getPeakMemoryUsedBytes();
   }
 
+  /**
+   * @return the total amount of time spent sorting data (in-memory only).
+   */
+  public long getSortTimeNanos() {
+    return sorter.getSortTimeNanos();
+  }
+
   private void cleanupResources() {
     sorter.cleanupResources();
   }
 
-  @VisibleForTesting
-  Iterator<UnsafeRow> sort() throws IOException {
+  public Iterator<UnsafeRow> sort() throws IOException {
     try {
       final UnsafeSorterIterator sortedIterator = sorter.getSortedIterator();
       if (!sortedIterator.hasNext()) {
@@ -152,14 +174,13 @@ final class UnsafeExternalRowSorter {
             Platform.throwException(e);
           }
           throw new RuntimeException("Exception should have been re-thrown in next()");
-        };
+        }
       };
     } catch (IOException e) {
       cleanupResources();
       throw e;
     }
   }
-
 
   public Iterator<UnsafeRow> sort(Iterator<UnsafeRow> inputIterator) throws IOException {
     while (inputIterator.hasNext()) {
@@ -174,7 +195,7 @@ final class UnsafeExternalRowSorter {
     private final UnsafeRow row1;
     private final UnsafeRow row2;
 
-    public RowComparator(Ordering<InternalRow> ordering, int numFields) {
+    RowComparator(Ordering<InternalRow> ordering, int numFields) {
       this.numFields = numFields;
       this.row1 = new UnsafeRow(numFields);
       this.row2 = new UnsafeRow(numFields);
